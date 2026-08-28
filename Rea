@@ -1,0 +1,913 @@
+import { useState, useEffect, useRef } from "react";
+import {
+  Cpu, Cloud, Camera, Power, Clock, Settings, Send, Trash2, Download,
+  Mic, Keyboard, Timer, RefreshCw, Video, Maximize2
+} from "lucide-react";
+
+const TOTAL_RAM_GB = 16;
+const DISK_USED_GB = 439;
+const DISK_TOTAL_GB = 475;
+
+// ElevenLabs voice (text-to-speech) credentials — embedded directly per user's
+// explicit choice. Anyone who opens this artifact can view these in source.
+const ELEVEN_VOICE_ID = "wDsJlOXPqcvIUKdLXjDs";
+const ELEVEN_API_KEY = "sk_8d55318358867eb826f0a9d35b4ce24d959f281efe34f512";
+
+const SYSTEM_PROMPT =
+  "You are J.A.R.V.I.S., a calm, concise AI assistant living inside a personal " +
+  "system-monitoring dashboard. Keep replies to 1-4 short sentences unless the user " +
+  "asks for more detail. You may address the user as \"sir\" occasionally, but don't " +
+  "overdo it. The dashboard around you shows simulated system stats, weather, and a " +
+  "camera panel \u2014 you do not have real control over any hardware or live external " +
+  "data, so if asked to actually change a system setting, fetch live weather, or " +
+  "control the camera, say so plainly rather than pretending to comply.";
+
+function clamp(v, min, max) {
+  return Math.min(max, Math.max(min, v));
+}
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+function formatHMS(totalSeconds) {
+  const h = String(Math.floor(totalSeconds / 3600)).padStart(2, "0");
+  const m = String(Math.floor((totalSeconds % 3600) / 60)).padStart(2, "0");
+  const s = String(totalSeconds % 60).padStart(2, "0");
+  return `${h}:${m}:${s}`;
+}
+
+function getLoadInfo(load) {
+  if (load < 20) return { label: "Low", color: "var(--green)" };
+  if (load < 40) return { label: "Moderate", color: "var(--amber)" };
+  return { label: "High", color: "var(--red)" };
+}
+
+export default function JarvisDashboard() {
+  const startTimeRef = useRef(new Date());
+  const seedTimeRef = useRef(new Date());
+  const inputRef = useRef(null);
+  const messagesEndRef = useRef(null);
+  const videoRef = useRef(null);
+  const streamRef = useRef(null);
+  const recognitionRef = useRef(null);
+  const audioRef = useRef(null);
+
+  const [now, setNow] = useState(new Date());
+  const [cpu, setCpu] = useState(8);
+  const [ramUsed, setRamUsed] = useState(7.0);
+  const [load, setLoad] = useState(26);
+  const [weather, setWeather] = useState({
+    temp: 25.2,
+    city: "Quezon City, PH",
+    cityShort: "Quezon City",
+    condition: "overcast clouds",
+    humidity: 94,
+    wind: 5.8,
+    feelsLike: 26.3,
+  });
+  const [commands, setCommands] = useState(0);
+  const [messages, setMessages] = useState(() => [
+    {
+      id: "seed",
+      role: "assistant",
+      text: "Hello, I am JARVIS. JARVIS backend is offline. Some features may be limited. How can I assist you today, sir?",
+      time: seedTimeRef.current,
+    },
+  ]);
+  const [inputValue, setInputValue] = useState("");
+  const [assistantStatus, setAssistantStatus] = useState("idle"); // idle | listening | thinking
+  const [cameraOn, setCameraOn] = useState(false);
+  const [cameraError, setCameraError] = useState("");
+  const [flash, setFlash] = useState(false);
+  const [voiceNotice, setVoiceNotice] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [soundOn, setSoundOn] = useState(true);
+  const [autoScroll, setAutoScroll] = useState(true);
+  const [upExpanded, setUpExpanded] = useState(false);
+
+  useEffect(() => {
+    const id = setInterval(() => {
+      setNow(new Date());
+      setCpu((c) => clamp(c + (Math.random() * 6 - 3), 3, 38));
+      setRamUsed((r) => clamp(r + (Math.random() * 0.5 - 0.25), 4, 13));
+      setLoad((l) => clamp(l + (Math.random() * 5 - 2.5), 8, 55));
+    }, 1600);
+    return () => clearInterval(id);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      streamRef.current && streamRef.current.getTracks().forEach((t) => t.stop());
+      audioRef.current && audioRef.current.pause();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (autoScroll) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    }
+  }, [messages, assistantStatus, autoScroll]);
+
+  useEffect(() => {
+    if (!settingsOpen) return;
+    function onClick(e) {
+      if (!e.target.closest(".jv-settings-wrap")) setSettingsOpen(false);
+    }
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [settingsOpen]);
+
+  async function speak(text) {
+    if (!soundOn) return;
+    try {
+      setAssistantStatus("speaking");
+      const res = await fetch(
+        `https://api.elevenlabs.io/v1/text-to-speech/${ELEVEN_VOICE_ID}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "xi-api-key": ELEVEN_API_KEY,
+            Accept: "audio/mpeg",
+          },
+          body: JSON.stringify({
+            text,
+            model_id: "eleven_multilingual_v2",
+            voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+          }),
+        }
+      );
+      if (!res.ok) throw new Error("tts failed");
+      const buf = await res.arrayBuffer();
+      const blob = new Blob([buf], { type: "audio/mpeg" });
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+      audioRef.current = audio;
+      await new Promise((resolve) => {
+        audio.onended = resolve;
+        audio.onerror = resolve;
+        audio.play().catch(resolve);
+      });
+      URL.revokeObjectURL(url);
+      audioRef.current = null;
+    } catch (e) {
+      /* TTS unavailable — the text reply is already shown, so fail silently */
+    } finally {
+      setAssistantStatus("idle");
+    }
+  }
+
+  function stopSpeaking() {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      audioRef.current = null;
+    }
+  }
+
+  async function sendMessage() {
+    const text = inputValue.trim();
+    if (!text || assistantStatus === "thinking" || assistantStatus === "speaking") return;
+    const userMsg = { id: uid(), role: "user", text, time: new Date() };
+    const updated = [...messages, userMsg];
+    setMessages(updated);
+    setInputValue("");
+    setCommands((c) => c + 1);
+    setAssistantStatus("thinking");
+    try {
+      const apiHistory = updated
+        .filter((m) => m.id !== "seed")
+        .map((m) => ({ role: m.role, content: m.text }));
+      const response = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6",
+          max_tokens: 1000,
+          system: SYSTEM_PROMPT,
+          messages: apiHistory,
+        }),
+      });
+      if (!response.ok) throw new Error("bad response");
+      const data = await response.json();
+      const textOut =
+        (data.content || [])
+          .filter((b) => b.type === "text")
+          .map((b) => b.text)
+          .join("\n")
+          .trim() || "Acknowledged.";
+      setMessages((m) => [
+        ...m,
+        { id: uid(), role: "assistant", text: textOut, time: new Date() },
+      ]);
+      if (soundOn) {
+        await speak(textOut);
+      } else {
+        setAssistantStatus("idle");
+      }
+    } catch (e) {
+      const offlineText =
+        "I can't reach my core systems right now, sir. Running in offline mode \u2014 please check the connection and try again.";
+      setMessages((m) => [
+        ...m,
+        { id: uid(), role: "assistant", text: offlineText, time: new Date() },
+      ]);
+      setAssistantStatus("idle");
+    }
+  }
+
+  function clearConversation() {
+    stopSpeaking();
+    setMessages([
+      {
+        id: "seed",
+        role: "assistant",
+        text: "Hello, I am JARVIS. JARVIS backend is offline. Some features may be limited. How can I assist you today, sir?",
+        time: new Date(),
+      },
+    ]);
+    setCommands(0);
+  }
+
+  function extractConversation() {
+    const lines = messages
+      .map(
+        (m) =>
+          `[${m.time.toLocaleTimeString()}] ${m.role === "user" ? "You" : "J.A.R.V.I.S"}: ${m.text}`
+      )
+      .join("\n");
+    const blob = new Blob([lines], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "jarvis-conversation.txt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function focusInput() {
+    inputRef.current?.focus();
+  }
+
+  function toggleMic() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (assistantStatus === "listening") {
+      recognitionRef.current && recognitionRef.current.stop();
+      setAssistantStatus("idle");
+      return;
+    }
+    if (assistantStatus === "speaking") {
+      stopSpeaking();
+    }
+    if (!SR) {
+      setAssistantStatus("listening");
+      setVoiceNotice("Voice recognition isn't supported in this browser \u2014 try typing instead.");
+      setTimeout(() => setAssistantStatus("idle"), 1800);
+      setTimeout(() => setVoiceNotice(""), 4200);
+      return;
+    }
+    const rec = new SR();
+    recognitionRef.current = rec;
+    rec.lang = "en-US";
+    rec.interimResults = false;
+    rec.maxAlternatives = 1;
+    rec.onstart = () => setAssistantStatus("listening");
+    rec.onresult = (e) => {
+      const transcript = e.results[0][0].transcript;
+      setInputValue((v) => (v ? v + " " : "") + transcript);
+    };
+    rec.onerror = () => {
+      setVoiceNotice("Microphone access was blocked or unavailable.");
+      setTimeout(() => setVoiceNotice(""), 4200);
+    };
+    rec.onend = () => setAssistantStatus("idle");
+    try {
+      rec.start();
+    } catch (e) {
+      setAssistantStatus("idle");
+    }
+  }
+
+  async function toggleCamera() {
+    if (cameraOn) {
+      streamRef.current && streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+      setCameraOn(false);
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      streamRef.current = stream;
+      if (videoRef.current) videoRef.current.srcObject = stream;
+      setCameraOn(true);
+      setCameraError("");
+    } catch (e) {
+      setCameraError("Camera access unavailable in this environment.");
+      setTimeout(() => setCameraError(""), 4200);
+    }
+  }
+
+  function handleSnapshot() {
+    if (!cameraOn) return;
+    setFlash(true);
+    setTimeout(() => setFlash(false), 180);
+  }
+
+  const timeStr = now.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  });
+  const dateStr = now.toLocaleDateString([], {
+    month: "long",
+    day: "numeric",
+    year: "numeric",
+  });
+  const uptimeSec = Math.max(0, Math.floor((now - startTimeRef.current) / 1000));
+  const loadInfo = getLoadInfo(load);
+  const statusText =
+    assistantStatus === "listening"
+      ? "Listening..."
+      : assistantStatus === "thinking"
+      ? "Processing..."
+      : assistantStatus === "speaking"
+      ? "Speaking..."
+      : "Listening for wake word...";
+  const memPct = Math.round((ramUsed / TOTAL_RAM_GB) * 100);
+
+  return (
+    <div className="jv-root">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Orbitron:wght@500;700;800&family=JetBrains+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap');
+        .jv-root{
+          --bg:#05070d; --panel-solid:#0b1220; --panel-2:#0e1728;
+          --border:rgba(94,169,222,0.18); --border-strong:rgba(94,169,222,0.4);
+          --cyan:#3fd0f2; --cyan-dim:#1c7fa0; --violet:#b98cf0; --violet-dim:#6b4d99;
+          --text:#dce8f5; --muted:#6f89a8; --green:#34d399; --amber:#f5b942; --red:#f2596b;
+          font-family:'Inter',system-ui,sans-serif;
+          color:var(--text);
+          background: radial-gradient(ellipse at 50% 28%, rgba(63,208,242,0.07), transparent 60%), var(--bg);
+          height:100vh; display:flex; flex-direction:column; overflow:hidden; position:relative;
+        }
+        .jv-root *{box-sizing:border-box;}
+        .jv-root::before{
+          content:''; position:absolute; inset:0; pointer-events:none;
+          background-image:
+            linear-gradient(rgba(94,169,222,0.035) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(94,169,222,0.035) 1px, transparent 1px);
+          background-size:42px 42px;
+          mask-image: radial-gradient(ellipse at 50% 40%, black 40%, transparent 80%);
+          -webkit-mask-image: radial-gradient(ellipse at 50% 40%, black 40%, transparent 80%);
+        }
+        .mono{font-family:'JetBrains Mono',monospace;}
+        .muted{color:var(--muted);}
+
+        .jv-header{
+          display:flex; align-items:center; justify-content:space-between;
+          padding:14px 24px; border-bottom:1px solid var(--border);
+          position:relative; z-index:3; flex-shrink:0; flex-wrap:wrap; gap:10px;
+        }
+        .jv-brand{display:flex; align-items:center; gap:14px;}
+        .jv-logo{font-family:'Orbitron',sans-serif; font-weight:700; font-size:20px; letter-spacing:2px;}
+        .jv-status-pill{
+          display:inline-flex; align-items:center; gap:6px; font-size:11px; padding:4px 10px;
+          border-radius:999px; border:1px solid var(--border); color:var(--muted);
+          text-transform:uppercase; letter-spacing:0.5px;
+        }
+        .jv-status-pill .dot{width:6px; height:6px; border-radius:50%; background:var(--muted);}
+        .jv-status-pill.online .dot, .jv-status-pill.idle .dot{background:var(--green); box-shadow:0 0 8px var(--green);}
+        .jv-status-pill.online, .jv-status-pill.idle{color:var(--green); border-color:rgba(52,211,153,0.3);}
+        .jv-status-pill.listening .dot{background:var(--cyan); box-shadow:0 0 8px var(--cyan);}
+        .jv-status-pill.listening{color:var(--cyan); border-color:rgba(63,208,242,0.35);}
+        .jv-status-pill.thinking .dot{background:var(--amber); box-shadow:0 0 8px var(--amber); animation:breathe 1s infinite;}
+        .jv-status-pill.thinking{color:var(--amber); border-color:rgba(245,185,66,0.35);}
+        .jv-status-pill.speaking .dot{background:var(--violet); box-shadow:0 0 8px var(--violet); animation:breathe 0.6s infinite;}
+        .jv-status-pill.speaking{color:var(--violet); border-color:rgba(185,140,240,0.35);}
+
+        .jv-clock{display:flex; align-items:center; gap:8px; font-size:13px;}
+        .jv-clock .sep{color:var(--border-strong);}
+        .jv-header-right{display:flex; align-items:center; gap:12px; position:relative;}
+        .jv-chip{
+          display:flex; align-items:center; gap:6px; background:var(--panel-2);
+          border:1px solid var(--border); padding:6px 12px; border-radius:10px; font-size:12px;
+        }
+        .jv-icon-btn{
+          display:inline-flex; align-items:center; justify-content:center; width:34px; height:34px;
+          border-radius:9px; background:var(--panel-2); border:1px solid var(--border); color:var(--text);
+          cursor:pointer;
+        }
+        .jv-icon-btn:hover{border-color:var(--border-strong); color:var(--cyan);}
+        .jv-icon-btn.ghost{width:26px; height:26px; background:transparent;}
+        .jv-settings-wrap{position:relative;}
+        .jv-settings-pop{
+          position:absolute; top:42px; right:0; background:var(--panel-solid); border:1px solid var(--border);
+          border-radius:12px; padding:12px; width:190px; box-shadow:0 12px 30px rgba(0,0,0,0.5); z-index:20;
+        }
+        .jv-toggle-row{display:flex; align-items:center; justify-content:space-between; font-size:12px; padding:6px 0;}
+        .jv-toggle-row input{accent-color:var(--cyan); width:15px; height:15px;}
+
+        .jv-body{
+          flex:1; min-height:0; display:grid; grid-template-columns:290px 1fr 380px; gap:20px;
+          padding:20px 24px; position:relative; z-index:1; overflow:hidden;
+        }
+        .jv-sidebar{display:flex; flex-direction:column; gap:16px; overflow-y:auto; padding-right:4px; min-height:0;}
+        .jv-center{display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px; min-height:0;}
+        .jv-chat{
+          display:flex; flex-direction:column; min-height:0; background:var(--panel-solid);
+          border:1px solid var(--border); border-radius:16px; overflow:hidden;
+        }
+
+        .jv-card{background:var(--panel-solid); border:1px solid var(--border); border-radius:14px; padding:16px; flex-shrink:0;}
+        .jv-card-head{display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;}
+        .jv-card-title{display:flex; align-items:center; gap:8px; font-size:13px; font-weight:600;}
+        .jv-card-head-actions{display:flex; align-items:center; gap:6px;}
+        .jv-stat-row{display:flex; align-items:center; justify-content:space-between; font-size:12.5px; color:var(--muted); margin-bottom:6px;}
+        .jv-stat-row.small{margin-bottom:0; font-size:11px;}
+        .jv-stat-row span:last-child{color:var(--text);}
+        .jv-bar{height:5px; border-radius:999px; background:rgba(255,255,255,0.06); overflow:hidden; margin-bottom:14px;}
+        .jv-bar-fill{height:100%; background:linear-gradient(90deg, var(--cyan-dim), var(--cyan)); border-radius:999px; transition:width 0.8s ease;}
+        .jv-mini-grid{display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-top:4px;}
+        .jv-mini-grid.two{grid-template-columns:repeat(2,1fr);}
+        .jv-mini{background:var(--panel-2); border:1px solid var(--border); border-radius:10px; padding:8px; display:flex; flex-direction:column; gap:4px; align-items:center; text-align:center;}
+        .jv-mini .muted{font-size:10.5px; text-transform:uppercase; letter-spacing:0.4px;}
+        .jv-mini .mono{font-size:13px; font-weight:600;}
+
+        .jv-weather-main{display:flex; align-items:center; justify-content:space-between; margin-bottom:12px;}
+        .jv-weather-temp{font-size:26px; font-weight:700;}
+        .jv-weather-city{font-size:13px; font-weight:600; margin-top:2px;}
+        .jv-weather-icon{color:var(--cyan); opacity:0.85;}
+
+        .jv-camera-box{
+          position:relative; height:150px; border-radius:10px; background:var(--panel-2);
+          border:1px solid var(--border); display:flex; align-items:center; justify-content:center;
+          overflow:hidden; margin-bottom:8px;
+        }
+        .jv-camera-feed{width:100%; height:100%; object-fit:cover;}
+        .jv-camera-placeholder{display:flex; flex-direction:column; align-items:center; gap:8px; color:var(--muted); font-size:12px;}
+        .jv-camera-flash{position:absolute; inset:0; background:#fff; opacity:0; pointer-events:none; transition:opacity 0.15s;}
+        .jv-camera-flash.on{opacity:0.85;}
+        .jv-hint{font-size:11px; color:var(--muted); margin:0;}
+
+        .jv-uptime-chip-wrap{display:flex; align-items:center; gap:6px;}
+        .jv-uptime-chip{background:var(--panel-2); border:1px solid var(--border); padding:3px 9px; border-radius:8px; font-size:12px;}
+        .jv-started-line{font-size:11px; color:var(--muted); margin:-2px 0 6px;}
+
+        .jv-orb-wrap{position:relative; width:230px; height:230px; display:flex; align-items:center; justify-content:center;}
+        .jv-orb-ring{position:absolute; border-radius:50%; border:1px solid var(--border-strong);}
+        .jv-orb-ring.r1{inset:0;}
+        .jv-orb-ring.r2{inset:28px;}
+        .jv-orb-ring.r3{inset:56px;}
+        .jv-orb-wrap.idle .jv-orb-ring{animation:breathe 3.4s infinite;}
+        .jv-orb-wrap.listening .jv-orb-ring, .jv-orb-wrap.thinking .jv-orb-ring{
+          border-color:var(--cyan-dim); animation:pulseRing 2s infinite;
+        }
+        .jv-orb-wrap.speaking .jv-orb-ring{
+          border-color:var(--violet-dim); animation:pulseRing 1.1s infinite;
+        }
+        .jv-orb-ring.r2{animation-delay:0.3s;}
+        .jv-orb-ring.r3{animation-delay:0.6s;}
+        .jv-orb-core{
+          width:120px; height:120px; border-radius:50%;
+          background:radial-gradient(circle at 35% 30%, rgba(63,208,242,0.35), rgba(15,30,45,0.9) 70%);
+          border:1px solid var(--cyan-dim); display:flex; align-items:center; justify-content:center;
+          box-shadow:0 0 40px rgba(63,208,242,0.25), inset 0 0 30px rgba(63,208,242,0.15);
+        }
+        .jv-eq{display:flex; align-items:center; gap:4px; height:24px;}
+        .jv-eq span{width:3px; height:100%; background:var(--cyan); border-radius:2px; animation:barBounce 1.2s ease-in-out infinite;}
+        .jv-eq span:nth-child(1){animation-delay:0s;}
+        .jv-eq span:nth-child(2){animation-delay:0.15s;}
+        .jv-eq span:nth-child(3){animation-delay:0.3s;}
+        .jv-eq span:nth-child(4){animation-delay:0.15s;}
+        .jv-eq span:nth-child(5){animation-delay:0s;}
+        .jv-orb-wrap.thinking .jv-eq span{animation-duration:0.5s;}
+        .jv-orb-wrap.idle .jv-eq span{animation-duration:1.8s; opacity:0.7;}
+        .jv-orb-wrap.speaking .jv-eq span{background:var(--violet); animation-duration:0.35s;}
+
+        .jv-title{font-family:'Orbitron',sans-serif; font-weight:700; letter-spacing:6px; font-size:24px; margin:0;}
+
+        .jv-quick-actions{display:flex; align-items:center; gap:14px;}
+        .jv-fab{
+          width:52px; height:52px; border-radius:50%; background:var(--panel-solid); border:1px solid var(--border);
+          display:flex; align-items:center; justify-content:center; color:var(--text); cursor:pointer;
+        }
+        .jv-fab:hover{border-color:var(--border-strong); color:var(--cyan);}
+        .jv-fab.active{color:#04141c; background:var(--cyan); border-color:var(--cyan); box-shadow:0 0 20px rgba(63,208,242,0.5);}
+        .jv-voice-notice{font-size:11px; color:var(--amber); text-align:center; max-width:260px; margin:0;}
+
+        .jv-chat-head{display:flex; align-items:center; justify-content:space-between; padding:16px 18px; border-bottom:1px solid var(--border); flex-shrink:0; flex-wrap:wrap; gap:8px;}
+        .jv-chat-head h2{font-size:16px; margin:0; font-weight:700;}
+        .jv-chat-actions{display:flex; gap:8px;}
+        .jv-pill-btn{
+          display:flex; align-items:center; gap:5px; font-size:11px; background:var(--panel-2);
+          border:1px solid var(--border); padding:6px 10px; border-radius:8px; color:var(--muted); cursor:pointer;
+        }
+        .jv-pill-btn:hover{color:var(--text); border-color:var(--border-strong);}
+
+        .jv-messages{flex:1; overflow-y:auto; padding:16px 18px; display:flex; flex-direction:column; gap:12px;}
+        .jv-msg{max-width:88%; padding:10px 13px; border-radius:12px; font-size:13.5px; line-height:1.5;}
+        .jv-msg p{margin:0 0 6px 0; white-space:pre-wrap;}
+        .jv-msg-time{font-size:10px; color:var(--muted);}
+        .jv-msg.assistant{align-self:flex-start; background:var(--panel-2); border:1px solid var(--border); border-top-left-radius:2px;}
+        .jv-msg.user{align-self:flex-end; background:linear-gradient(135deg, rgba(63,208,242,0.22), rgba(63,208,242,0.08)); border:1px solid var(--cyan-dim); border-top-right-radius:2px;}
+        .jv-msg.thinking{display:flex; align-items:center; padding:12px 16px;}
+        .jv-typing{display:flex; gap:4px;}
+        .jv-typing span{width:5px; height:5px; border-radius:50%; background:var(--muted); animation:breathe 1s infinite;}
+        .jv-typing span:nth-child(2){animation-delay:0.2s;}
+        .jv-typing span:nth-child(3){animation-delay:0.4s;}
+
+        .jv-input-row{display:flex; align-items:center; gap:10px; padding:14px 18px; border-top:1px solid var(--border); flex-shrink:0;}
+        .jv-input{
+          flex:1; background:var(--panel-2); border:1px solid var(--border); border-radius:10px; padding:11px 14px;
+          color:var(--text); font-size:13.5px; font-family:inherit;
+        }
+        .jv-input::placeholder{color:var(--muted);}
+        .jv-input:focus{outline:none; border-color:var(--cyan-dim);}
+        .jv-send-btn{
+          width:40px; height:40px; border-radius:10px; background:var(--cyan); border:none; color:#04141c;
+          display:flex; align-items:center; justify-content:center; cursor:pointer; flex-shrink:0;
+        }
+        .jv-send-btn:disabled{background:var(--panel-2); color:var(--muted); cursor:not-allowed;}
+
+        @keyframes pulseRing{0%{transform:scale(0.9); opacity:0.7;}70%{transform:scale(1.05); opacity:0.15;}100%{transform:scale(0.9); opacity:0.7;}}
+        @keyframes breathe{0%,100%{opacity:0.4;}50%{opacity:1;}}
+        @keyframes barBounce{0%,100%{transform:scaleY(0.35);}50%{transform:scaleY(1);}}
+
+        .jv-root :focus-visible{outline:2px solid var(--cyan); outline-offset:2px;}
+
+        @media (prefers-reduced-motion: reduce){
+          .jv-root *{animation-duration:0.01ms !important; animation-iteration-count:1 !important; transition-duration:0.01ms !important;}
+        }
+
+        @media (max-width: 1000px){
+          .jv-body{grid-template-columns:1fr; overflow-y:auto;}
+          .jv-center{order:1;}
+          .jv-chat{order:2; height:480px;}
+          .jv-sidebar{order:3; overflow-y:visible;}
+          .jv-header{padding:12px 16px;}
+          .jv-logo{font-size:16px;}
+        }
+        @media (max-width: 480px){
+          .jv-orb-wrap{width:180px; height:180px;}
+          .jv-orb-core{width:96px; height:96px;}
+          .jv-title{font-size:19px; letter-spacing:4px;}
+          .jv-clock{font-size:11px;}
+          .jv-chip span:last-child{display:none;}
+        }
+      `}</style>
+
+      <header className="jv-header">
+        <div className="jv-brand">
+          <span className="jv-logo">J·A·R·V·I·S</span>
+          <span className="jv-status-pill online">
+            <span className="dot" /> Online
+          </span>
+        </div>
+        <div className="jv-clock">
+          <Clock size={15} />
+          <span className="mono">{timeStr}</span>
+          <span className="sep">|</span>
+          <span>{dateStr}</span>
+        </div>
+        <div className="jv-header-right">
+          <div className="jv-chip">
+            <Cloud size={14} />
+            <span className="mono">{weather.temp.toFixed(1)}°C</span>
+            <span className="muted">{weather.cityShort}</span>
+          </div>
+          <div className="jv-settings-wrap">
+            <button
+              className="jv-icon-btn"
+              type="button"
+              onClick={() => setSettingsOpen((o) => !o)}
+              aria-label="Settings"
+            >
+              <Settings size={18} />
+            </button>
+            {settingsOpen && (
+              <div className="jv-settings-pop">
+                <label className="jv-toggle-row">
+                  <span>Voice replies</span>
+                  <input
+                    type="checkbox"
+                    checked={soundOn}
+                    onChange={(e) => setSoundOn(e.target.checked)}
+                  />
+                </label>
+                <label className="jv-toggle-row">
+                  <span>Auto-scroll</span>
+                  <input
+                    type="checkbox"
+                    checked={autoScroll}
+                    onChange={(e) => setAutoScroll(e.target.checked)}
+                  />
+                </label>
+              </div>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <div className="jv-body">
+        <aside className="jv-sidebar">
+          <div className="jv-card">
+            <div className="jv-card-head">
+              <span className="jv-card-title">
+                <Cpu size={15} /> System Stats
+              </span>
+              <button
+                className="jv-icon-btn ghost"
+                type="button"
+                aria-label="Refresh system stats"
+                onClick={() => {
+                  setCpu((c) => clamp(c + (Math.random() * 6 - 3), 3, 38));
+                  setRamUsed((r) => clamp(r + (Math.random() * 0.6 - 0.3), 4, 13));
+                }}
+              >
+                <RefreshCw size={14} />
+              </button>
+            </div>
+            <div className="jv-stat-row">
+              <span>CPU Usage</span>
+              <span className="mono">{Math.round(cpu)}%</span>
+            </div>
+            <div className="jv-bar">
+              <div className="jv-bar-fill" style={{ width: `${cpu}%` }} />
+            </div>
+            <div className="jv-stat-row">
+              <span>RAM Usage</span>
+              <span className="mono">{ramUsed.toFixed(1)} GB</span>
+            </div>
+            <div className="jv-bar">
+              <div className="jv-bar-fill" style={{ width: `${memPct}%` }} />
+            </div>
+            <div className="jv-mini-grid">
+              <div className="jv-mini">
+                <span className="muted">CPU</span>
+                <span className="mono">{Math.round(cpu)}%</span>
+              </div>
+              <div className="jv-mini">
+                <span className="muted">Memory</span>
+                <span className="mono">{memPct}%</span>
+              </div>
+              <div className="jv-mini">
+                <span className="muted">Disk</span>
+                <span className="mono">
+                  {DISK_USED_GB}/{DISK_TOTAL_GB} GB
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="jv-card">
+            <div className="jv-card-head">
+              <span className="jv-card-title">
+                <Cloud size={15} /> Weather
+              </span>
+              <button
+                className="jv-icon-btn ghost"
+                type="button"
+                aria-label="Refresh weather"
+                onClick={() =>
+                  setWeather((w) => ({
+                    ...w,
+                    temp: clamp(w.temp + (Math.random() * 0.6 - 0.3), 20, 32),
+                    humidity: clamp(w.humidity + (Math.random() * 4 - 2), 60, 99),
+                    wind: clamp(w.wind + (Math.random() * 0.8 - 0.4), 1, 12),
+                  }))
+                }
+              >
+                <RefreshCw size={14} />
+              </button>
+            </div>
+            <div className="jv-weather-main">
+              <div>
+                <div className="jv-weather-temp mono">{weather.temp.toFixed(1)}°C</div>
+                <div className="jv-weather-city">{weather.city}</div>
+                <div className="muted" style={{ fontSize: "12px" }}>
+                  {weather.condition}
+                </div>
+              </div>
+              <Cloud size={40} className="jv-weather-icon" />
+            </div>
+            <div className="jv-mini-grid">
+              <div className="jv-mini">
+                <span className="muted">Humidity</span>
+                <span className="mono">{Math.round(weather.humidity)}%</span>
+              </div>
+              <div className="jv-mini">
+                <span className="muted">Wind</span>
+                <span className="mono">{weather.wind.toFixed(1)} m/s</span>
+              </div>
+              <div className="jv-mini">
+                <span className="muted">Feels Like</span>
+                <span className="mono">{weather.feelsLike.toFixed(1)}°C</span>
+              </div>
+            </div>
+          </div>
+
+          <div className="jv-card">
+            <div className="jv-card-head">
+              <span className="jv-card-title">
+                <Camera size={15} /> Camera
+              </span>
+              <div className="jv-card-head-actions">
+                <button
+                  className="jv-icon-btn ghost"
+                  type="button"
+                  aria-label="Take snapshot"
+                  disabled={!cameraOn}
+                  onClick={handleSnapshot}
+                >
+                  <Camera size={14} />
+                </button>
+                <button
+                  className="jv-icon-btn ghost"
+                  type="button"
+                  aria-label={cameraOn ? "Turn camera off" : "Turn camera on"}
+                  onClick={toggleCamera}
+                  style={cameraOn ? { color: "var(--cyan)", borderColor: "var(--cyan-dim)" } : undefined}
+                >
+                  <Power size={14} />
+                </button>
+              </div>
+            </div>
+            <div className="jv-camera-box">
+              {cameraOn ? (
+                <video ref={videoRef} autoPlay playsInline muted className="jv-camera-feed" />
+              ) : (
+                <div className="jv-camera-placeholder">
+                  <Video size={26} />
+                  <span>Camera Off</span>
+                </div>
+              )}
+              <div className={`jv-camera-flash ${flash ? "on" : ""}`} />
+            </div>
+            <p className="jv-hint">
+              {cameraError ||
+                (cameraOn
+                  ? "Live feed active. Click the power button to stop."
+                  : "Camera is inactive. Click the power button to start.")}
+            </p>
+          </div>
+
+          <div className="jv-card">
+            <div className="jv-card-head">
+              <span className="jv-card-title">
+                <Timer size={15} /> System Uptime
+              </span>
+              <div className="jv-uptime-chip-wrap">
+                <span className="mono jv-uptime-chip">{formatHMS(uptimeSec)}</span>
+                <button
+                  className="jv-icon-btn ghost"
+                  type="button"
+                  aria-label="Toggle uptime detail"
+                  onClick={() => setUpExpanded((v) => !v)}
+                >
+                  <Maximize2 size={12} />
+                </button>
+              </div>
+            </div>
+            {upExpanded && (
+              <p className="jv-started-line">
+                Session started at {seedTimeRef.current.toLocaleTimeString()}
+              </p>
+            )}
+            <div className="jv-stat-row">
+              <span>System Running For:</span>
+              <span className="mono">{formatHMS(uptimeSec)}</span>
+            </div>
+            <div className="jv-mini-grid two">
+              <div className="jv-mini">
+                <span className="muted">Session</span>
+                <span className="mono">1</span>
+              </div>
+              <div className="jv-mini">
+                <span className="muted">Commands</span>
+                <span className="mono">{commands}</span>
+              </div>
+            </div>
+            <div className="jv-stat-row" style={{ marginTop: "12px" }}>
+              <span>System Load</span>
+              <span className="mono">{Math.round(load)}%</span>
+            </div>
+            <div className="jv-bar">
+              <div
+                className="jv-bar-fill"
+                style={{ width: `${load}%`, background: loadInfo.color }}
+              />
+            </div>
+            <div className="jv-stat-row small">
+              <span style={{ color: loadInfo.color }}>{loadInfo.label}</span>
+              <span></span>
+            </div>
+          </div>
+        </aside>
+
+        <section className="jv-center">
+          <div className={`jv-orb-wrap ${assistantStatus}`}>
+            <div className="jv-orb-ring r1" />
+            <div className="jv-orb-ring r2" />
+            <div className="jv-orb-ring r3" />
+            <div className="jv-orb-core">
+              <div className="jv-eq">
+                <span />
+                <span />
+                <span />
+                <span />
+                <span />
+              </div>
+            </div>
+          </div>
+          <h1 className="jv-title">J.A.R.V.I.S</h1>
+          <div className={`jv-status-pill ${assistantStatus}`}>
+            <span className="dot" /> {statusText}
+          </div>
+          <div className="jv-quick-actions">
+            <button
+              className={`jv-fab ${cameraOn ? "active" : ""}`}
+              type="button"
+              aria-label="Toggle camera"
+              onClick={toggleCamera}
+            >
+              <Camera size={20} />
+            </button>
+            <button
+              className={`jv-fab ${assistantStatus === "listening" ? "active" : ""}`}
+              type="button"
+              aria-label="Toggle microphone"
+              onClick={toggleMic}
+            >
+              <Mic size={20} />
+            </button>
+            <button className="jv-fab" type="button" aria-label="Focus message input" onClick={focusInput}>
+              <Keyboard size={20} />
+            </button>
+          </div>
+          {voiceNotice && <p className="jv-voice-notice">{voiceNotice}</p>}
+        </section>
+
+        <aside className="jv-chat">
+          <div className="jv-chat-head">
+            <h2>Conversation</h2>
+            <div className="jv-chat-actions">
+              <button className="jv-pill-btn" type="button" onClick={clearConversation}>
+                <Trash2 size={13} /> Clear
+              </button>
+              <button className="jv-pill-btn" type="button" onClick={extractConversation}>
+                <Download size={13} /> Extract Conversation
+              </button>
+            </div>
+          </div>
+          <div className="jv-messages">
+            {messages.map((m) => (
+              <div key={m.id} className={`jv-msg ${m.role}`}>
+                <p>{m.text}</p>
+                <span className="jv-msg-time">
+                  {m.time.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
+                </span>
+              </div>
+            ))}
+            {assistantStatus === "thinking" && (
+              <div className="jv-msg assistant thinking">
+                <span className="jv-typing">
+                  <span />
+                  <span />
+                  <span />
+                </span>
+              </div>
+            )}
+            <div ref={messagesEndRef} />
+          </div>
+          <div className="jv-input-row">
+            <input
+              ref={inputRef}
+              className="jv-input"
+              placeholder="Type a message..."
+              value={inputValue}
+              onChange={(e) => setInputValue(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey) {
+                  e.preventDefault();
+                  sendMessage();
+                }
+              }}
+              disabled={assistantStatus === "thinking" || assistantStatus === "speaking"}
+            />
+            <button
+              className="jv-send-btn"
+              type="button"
+              aria-label="Send message"
+              onClick={sendMessage}
+              disabled={!inputValue.trim() || assistantStatus === "thinking" || assistantStatus === "speaking"}
+            >
+              <Send size={16} />
+            </button>
+          </div>
+        </aside>
+      </div>
+    </div>
+  );
+}
